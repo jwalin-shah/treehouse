@@ -5,6 +5,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1254,4 +1255,168 @@ func TestSupersedeDestroyReservationProbe(t *testing.T) {
 func quoteForShell(p string) string {
 	// Double-quote works in both sh and cmd.exe for paths without quotes.
 	return `"` + p + `"`
+}
+
+func TestConcurrency(t *testing.T) {
+	t.Run("10 agents acquire pool size 1", func(t *testing.T) {
+		repoDir, poolDir := setupRepo(t)
+		var wg sync.WaitGroup
+		startCh := make(chan struct{})
+		results := make([]error, 10)
+		paths := make([]string, 10)
+
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-startCh // Wait for all to be ready
+				p, err := Acquire(repoDir, poolDir, 1, nil)
+				paths[idx] = p
+				results[idx] = err
+			}(i)
+		}
+		close(startCh) // Unleash all agents
+		wg.Wait()
+
+		successCount := 0
+		for _, err := range results {
+			if err == nil {
+				successCount++
+			}
+		}
+		if successCount != 1 {
+			t.Fatalf("expected exactly 1 success, got %d", successCount)
+		}
+	})
+
+	t.Run("10 agents acquire pool size 10", func(t *testing.T) {
+		repoDir, poolDir := setupRepo(t)
+		var wg sync.WaitGroup
+		startCh := make(chan struct{})
+		results := make([]error, 10)
+		paths := make([]string, 10)
+
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-startCh
+				p, err := Acquire(repoDir, poolDir, 10, nil)
+				paths[idx] = p
+				results[idx] = err
+			}(i)
+		}
+		close(startCh)
+		wg.Wait()
+
+		successCount := 0
+		uniquePaths := make(map[string]bool)
+		for i, err := range results {
+			if err == nil {
+				successCount++
+				if paths[i] != "" {
+					uniquePaths[paths[i]] = true
+				}
+			}
+		}
+		if successCount != 10 {
+			t.Fatalf("expected 10 successes, got %d", successCount)
+		}
+		if len(uniquePaths) != 10 {
+			t.Fatalf("expected 10 unique paths, got %d", len(uniquePaths))
+		}
+	})
+
+	t.Run("10 agents release same worktree", func(t *testing.T) {
+		repoDir, poolDir := setupRepo(t)
+		wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		startCh := make(chan struct{})
+		results := make([]error, 10)
+
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-startCh
+				results[idx] = Release(poolDir, wtPath)
+			}(i)
+		}
+		close(startCh)
+		wg.Wait()
+
+		for i, err := range results {
+			if err != nil {
+				t.Logf("agent %d release error: %v", i, err)
+			}
+		}
+	})
+
+	t.Run("10 agents destroy same worktree", func(t *testing.T) {
+		repoDir, poolDir := setupRepo(t)
+		wtPath, err := Acquire(repoDir, poolDir, 1, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var wg sync.WaitGroup
+		startCh := make(chan struct{})
+		results := make([]error, 10)
+
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-startCh
+				results[idx] = Destroy(repoDir, poolDir, wtPath, true, nil)
+			}(i)
+		}
+		close(startCh)
+		wg.Wait()
+
+		for i, err := range results {
+			if err != nil {
+				t.Logf("agent %d destroy error: %v", i, err)
+			}
+		}
+	})
+
+	t.Run("10 agents mix acquire and release", func(t *testing.T) {
+		repoDir, poolDir := setupRepo(t)
+
+		// Pre-populate some trees
+		for i := 0; i < 2; i++ {
+			if _, err := Acquire(repoDir, poolDir, 5, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if st, err := List(poolDir); err == nil {
+			for _, wt := range st {
+				_ = Release(poolDir, wt.Path)
+			}
+		}
+
+		var wg sync.WaitGroup
+		startCh := make(chan struct{})
+
+		for i := 0; i < 10; i++ {
+			wg.Add(1)
+			go func(idx int) {
+				defer wg.Done()
+				<-startCh
+
+				p, err := Acquire(repoDir, poolDir, 5, nil)
+				if err == nil && p != "" {
+					time.Sleep(10 * time.Millisecond)
+					_ = Release(poolDir, p)
+				}
+			}(i)
+		}
+		close(startCh)
+		wg.Wait()
+	})
 }
