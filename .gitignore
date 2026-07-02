@@ -18,3 +18,7 @@ Thumbs.db
 
 # Test
 coverage.out
+# CocoIndex Code (ccc)
+/.cocoindex_code/
+.tldr/
+.tldrignore
