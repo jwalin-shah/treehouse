@@ -434,6 +434,222 @@ func TestGetAndStatus(t *testing.T) {
 	}
 }
 
+func TestGetLeasePrintsOnlyPathToStdout(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	stdout, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("treehouse get --lease failed (code %d): %s", code, stderr)
+	}
+
+	// stdout must be exactly the worktree path on a single line, so scripts can
+	// do path=$(treehouse get --lease).
+	lines := strings.Split(strings.TrimRight(stdout, "\n"), "\n")
+	if len(lines) != 1 {
+		t.Fatalf("expected exactly one stdout line, got %d:\n%q", len(lines), stdout)
+	}
+	wtPath := lines[0]
+	if !filepath.IsAbs(wtPath) {
+		t.Fatalf("expected an absolute path on stdout, got %q", wtPath)
+	}
+	if _, err := os.Stat(filepath.Join(wtPath, "README.md")); err != nil {
+		t.Fatalf("expected leased worktree to contain repo content: %v", err)
+	}
+
+	// Human-facing banners go to stderr only.
+	if strings.Contains(stdout, "🌳") || strings.Contains(stdout, "Leased worktree") {
+		t.Fatalf("stdout must contain only the path, got:\n%q", stdout)
+	}
+	if !strings.Contains(stderr, "Leased worktree at") {
+		t.Fatalf("expected lease banner on stderr, got:\n%s", stderr)
+	}
+
+	// status reports the durable lease as a distinct state.
+	statusOut, statusErr, code := runTreehouse(t, repoDir, homeDir, nil, "status")
+	if code != 0 {
+		t.Fatalf("status failed (code %d): %s", code, statusErr)
+	}
+	if !strings.Contains(statusOut, "leased") {
+		t.Fatalf("expected status to show leased state, got:\n%s", statusOut)
+	}
+}
+
+func TestGetLeaseRecordsHolder(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	_, stderr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease", "--lease-holder", "secondmate-home")
+	if code != 0 {
+		t.Fatalf("treehouse get --lease failed (code %d): %s", code, stderr)
+	}
+
+	statusOut, statusErr, code := runTreehouse(t, repoDir, homeDir, nil, "status")
+	if code != 0 {
+		t.Fatalf("status failed (code %d): %s", code, statusErr)
+	}
+	if !strings.Contains(statusOut, "leased") || !strings.Contains(statusOut, "secondmate-home") {
+		t.Fatalf("expected status to show lease holder, got:\n%s", statusOut)
+	}
+}
+
+func TestLeasedWorktreeSkippedByGetAndPrune(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	leaseOut, leaseErr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get --lease failed (code %d): %s", code, leaseErr)
+	}
+	leasedPath := strings.TrimSpace(leaseOut)
+	if leasedPath == "" {
+		t.Fatal("could not capture leased worktree path")
+	}
+
+	// A later interactive get must not hand out the leased worktree.
+	env := []string{"SHELL=" + exitShellBin}
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get failed (code %d): %s", code, getErr)
+	}
+	otherPath := extractWorktreePath(getErr, homeDir)
+	if otherPath == "" {
+		t.Fatal("could not extract second worktree path")
+	}
+	if otherPath == leasedPath {
+		t.Fatalf("get handed out the leased worktree %s", leasedPath)
+	}
+
+	// prune must never remove the leased worktree, even with no process inside.
+	pruneOut, pruneErr, code := runTreehouse(t, repoDir, homeDir, nil, "prune", "--yes")
+	if code != 0 {
+		t.Fatalf("prune --yes failed (code %d): %s", code, pruneErr)
+	}
+	prettyLeased := "~" + leasedPath[len(homeDir):]
+	if strings.Contains(pruneOut, prettyLeased) {
+		t.Fatalf("prune listed the leased worktree %s:\n%s", prettyLeased, pruneOut)
+	}
+	if _, err := os.Stat(leasedPath); err != nil {
+		t.Fatalf("prune removed leased worktree %s: %v", leasedPath, err)
+	}
+}
+
+func TestReturnReleasesLease(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	leaseOut, leaseErr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get --lease failed (code %d): %s", code, leaseErr)
+	}
+	leasedPath := strings.TrimSpace(leaseOut)
+	if leasedPath == "" {
+		t.Fatal("could not capture leased worktree path")
+	}
+
+	_, returnErr, code := runTreehouse(t, repoDir, homeDir, nil, "return", leasedPath)
+	if code != 0 {
+		t.Fatalf("return failed (code %d): %s", code, returnErr)
+	}
+	if !strings.Contains(returnErr, "Worktree returned to pool") {
+		t.Fatalf("expected return confirmation, got: %s", returnErr)
+	}
+
+	// Status no longer reports the worktree as leased.
+	statusOut, statusErr, code := runTreehouse(t, repoDir, homeDir, nil, "status")
+	if code != 0 {
+		t.Fatalf("status failed (code %d): %s", code, statusErr)
+	}
+	if strings.Contains(statusOut, "leased") {
+		t.Fatalf("expected lease to be released, got status:\n%s", statusOut)
+	}
+	if !strings.Contains(statusOut, "available") {
+		t.Fatalf("expected released worktree to be available, got status:\n%s", statusOut)
+	}
+
+	// The released worktree is reusable by a normal get.
+	env := []string{"SHELL=" + exitShellBin}
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get after release failed (code %d): %s", code, getErr)
+	}
+	reusedPath := extractWorktreePath(getErr, homeDir)
+	if reusedPath != leasedPath {
+		t.Fatalf("expected released worktree %s to be reused, got %s", leasedPath, reusedPath)
+	}
+}
+
+func TestReturnExplicitPathFromOutsideRepoReleasesLease(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	leaseOut, leaseErr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get --lease failed (code %d): %s", code, leaseErr)
+	}
+	leasedPath := strings.TrimSpace(leaseOut)
+	if leasedPath == "" {
+		t.Fatal("could not capture leased worktree path")
+	}
+
+	outsideDir := t.TempDir()
+	_, returnErr, code := runTreehouseFromDir(t, repoDir, outsideDir, homeDir, nil, "return", leasedPath)
+	if code != 0 {
+		t.Fatalf("return from outside repo failed (code %d): %s", code, returnErr)
+	}
+	if !strings.Contains(returnErr, "Worktree returned to pool") {
+		t.Fatalf("expected return confirmation, got: %s", returnErr)
+	}
+
+	statusOut, statusErr, code := runTreehouse(t, repoDir, homeDir, nil, "status")
+	if code != 0 {
+		t.Fatalf("status failed (code %d): %s", code, statusErr)
+	}
+	if strings.Contains(statusOut, "leased") || strings.Contains(statusOut, "in-use") {
+		t.Fatalf("expected status to show lease released, got:\n%s", statusOut)
+	}
+	if !strings.Contains(statusOut, "available") {
+		t.Fatalf("expected returned worktree to be available, got:\n%s", statusOut)
+	}
+}
+
+func TestReturnExplicitPathFromLinkedWorktreePool(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	if err := os.WriteFile(filepath.Join(repoDir, "treehouse.toml"), []byte("root = \"../treehouse-pool\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repoDir, "add", "treehouse.toml")
+	gitCmd(t, repoDir, "commit", "-m", "configure treehouse root")
+
+	linkedDir := filepath.Join(filepath.Dir(repoDir), "agent-home")
+	gitCmd(t, repoDir, "worktree", "add", "-b", "agent-home", linkedDir, "main")
+
+	leaseOut, leaseErr, code := runTreehouseFromDir(t, repoDir, linkedDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get --lease from linked worktree failed (code %d): %s", code, leaseErr)
+	}
+	leasedPath := strings.TrimSpace(leaseOut)
+	if leasedPath == "" {
+		t.Fatal("could not capture leased worktree path")
+	}
+
+	outsideDir := t.TempDir()
+	_, returnErr, code := runTreehouseFromDir(t, repoDir, outsideDir, homeDir, nil, "return", leasedPath)
+	if code != 0 {
+		t.Fatalf("return from outside repo failed (code %d): %s", code, returnErr)
+	}
+	if !strings.Contains(returnErr, "Worktree returned to pool") {
+		t.Fatalf("expected return confirmation, got: %s", returnErr)
+	}
+
+	statusOut, statusErr, code := runTreehouseFromDir(t, repoDir, linkedDir, homeDir, nil, "status")
+	if code != 0 {
+		t.Fatalf("status failed (code %d): %s", code, statusErr)
+	}
+	if strings.Contains(statusOut, "leased") || strings.Contains(statusOut, "in-use") {
+		t.Fatalf("expected status to show lease released, got:\n%s", statusOut)
+	}
+	if !strings.Contains(statusOut, "available") {
+		t.Fatalf("expected returned worktree to be available, got:\n%s", statusOut)
+	}
+}
+
 func TestGetReusesWorktree(t *testing.T) {
 	repoDir, homeDir := setupTestRepo(t)
 	env := []string{"SHELL=" + exitShellBin}
@@ -594,7 +810,7 @@ func TestReturnForceCleansConflictedWorktree(t *testing.T) {
 	}
 }
 
-func TestDestroySpecific(t *testing.T) {
+func TestDestroyDryRunByDefault(t *testing.T) {
 	repoDir, homeDir := setupTestRepo(t)
 	env := []string{"SHELL=" + exitShellBin}
 
@@ -607,11 +823,41 @@ func TestDestroySpecific(t *testing.T) {
 		t.Fatal("could not extract worktree path")
 	}
 
-	_, destroyErr, code := runTreehouse(t, repoDir, homeDir, nil, "destroy", "--force", wtPath)
+	out, errOut, code := runTreehouse(t, repoDir, homeDir, nil, "destroy", wtPath)
 	if code != 0 {
-		t.Fatalf("destroy --force failed (code %d): %s", code, destroyErr)
+		t.Fatalf("destroy dry run failed (code %d): %s", code, errOut)
+	}
+	if !strings.Contains(out, "Dry run") || !strings.Contains(out, "would destroy 1 worktree") {
+		t.Fatalf("expected dry-run preview, got stdout:\n%s", out)
+	}
+	if !strings.Contains(out, "[disposable]") {
+		t.Fatalf("expected [disposable] status tag, got stdout:\n%s", out)
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("dry run removed worktree %s: %v", wtPath, err)
+	}
+}
+
+func TestDestroySpecificWithYes(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	env := []string{"SHELL=" + exitShellBin}
+
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get failed (code %d): %s", code, getErr)
+	}
+	wtPath := extractWorktreePath(getErr, homeDir)
+	if wtPath == "" {
+		t.Fatal("could not extract worktree path")
 	}
 
+	out, errOut, code := runTreehouse(t, repoDir, homeDir, nil, "destroy", wtPath, "--yes")
+	if code != 0 {
+		t.Fatalf("destroy --yes failed (code %d): %s", code, errOut)
+	}
+	if !strings.Contains(out, "Destroyed 1 worktree") {
+		t.Fatalf("expected destroyed summary, got stdout:\n%s", out)
+	}
 	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
 		t.Errorf("worktree directory still exists after destroy: %s", wtPath)
 	}
@@ -623,29 +869,232 @@ func TestDestroySpecific(t *testing.T) {
 	}
 }
 
-func TestDestroyAll(t *testing.T) {
+func TestDestroySpecificSkipsWhenCallerStillInWorktree(t *testing.T) {
 	repoDir, homeDir := setupTestRepo(t)
 	env := []string{"SHELL=" + exitShellBin}
 
-	// Create two worktrees by doing get→return twice with pool size > 1.
-	// The second get reuses the first, so force a second by making the first
-	// dirty between gets. Instead, just verify destroy --all works with one.
 	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
 	if code != 0 {
 		t.Fatalf("get failed (code %d): %s", code, getErr)
 	}
 	wtPath := extractWorktreePath(getErr, homeDir)
+	if wtPath == "" {
+		t.Fatal("could not extract worktree path")
+	}
 
-	_, destroyErr, code := runTreehouse(t, repoDir, homeDir, nil, "destroy", "--all", "--force")
+	out, errOut, code := runTreehouseFromDir(t, repoDir, wtPath, homeDir, nil, "destroy", wtPath, "--include-in-use", "--yes")
+	if code == 0 {
+		t.Fatal("expected destroy from inside the target worktree to fail")
+	}
+	if !strings.Contains(out, "Skipped 1 worktree") || !strings.Contains(out+errOut, "worktree processes still running after termination") {
+		t.Fatalf("expected survivor-process skip, got stdout:\n%s\nstderr:\n%s", out, errOut)
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("expected in-use worktree to remain on disk: %v", err)
+	}
+}
+
+func TestDestroyDirtyRequiresIncludeUnlanded(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	env := []string{"SHELL=" + exitShellBin}
+
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
 	if code != 0 {
-		t.Fatalf("destroy --all --force failed (code %d): %s", code, destroyErr)
+		t.Fatalf("get failed (code %d): %s", code, getErr)
 	}
-	if !strings.Contains(destroyErr, "All worktrees destroyed") {
-		t.Errorf("expected 'All worktrees destroyed' in stderr: %s", destroyErr)
+	wtPath := extractWorktreePath(getErr, homeDir)
+	if wtPath == "" {
+		t.Fatal("could not extract worktree path")
+	}
+	if err := os.WriteFile(filepath.Join(wtPath, "wip.txt"), []byte("wip\n"), 0o644); err != nil {
+		t.Fatal(err)
 	}
 
+	out, errOut, code := runTreehouse(t, repoDir, homeDir, nil, "destroy", wtPath, "--yes")
+	if code == 0 {
+		t.Fatalf("expected destroy of a dirty worktree without --include-unlanded to fail")
+	}
+	if !strings.Contains(out, "[dirty]") {
+		t.Fatalf("expected [dirty] tag in preview, got stdout:\n%s", out)
+	}
+	if !strings.Contains(out+errOut, "--include-unlanded") {
+		t.Fatalf("expected --include-unlanded guidance, got:\n%s\n%s", out, errOut)
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("expected dirty worktree to remain on disk: %v", err)
+	}
+
+	out, errOut, code = runTreehouse(t, repoDir, homeDir, nil, "destroy", wtPath, "--include-unlanded", "--yes")
+	if code != 0 {
+		t.Fatalf("destroy --include-unlanded --yes failed (code %d): %s", code, errOut)
+	}
+	if !strings.Contains(out, "Destroyed 1 worktree") {
+		t.Fatalf("expected destroyed summary, got stdout:\n%s", out)
+	}
 	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
-		t.Errorf("worktree directory still exists after destroy --all: %s", wtPath)
+		t.Errorf("dirty worktree still exists after --include-unlanded --yes: %s", wtPath)
+	}
+}
+
+func TestDestroyAllRemovesPoolAndIsScopedToIt(t *testing.T) {
+	repoA, homeDir := setupTestRepo(t)
+	repoB := setupTestRepoWithHome(t, homeDir, "otherrepo")
+	env := []string{"SHELL=" + exitShellBin}
+
+	_, getErrA, code := runTreehouse(t, repoA, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get in repoA failed (code %d): %s", code, getErrA)
+	}
+	wtA := extractWorktreePath(getErrA, homeDir)
+
+	_, getErrB, code := runTreehouse(t, repoB, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get in repoB failed (code %d): %s", code, getErrB)
+	}
+	wtB := extractWorktreePath(getErrB, homeDir)
+	if wtA == "" || wtB == "" {
+		t.Fatalf("could not extract worktree paths: A=%q B=%q", wtA, wtB)
+	}
+
+	out, errOut, code := runTreehouse(t, repoA, homeDir, nil, "destroy", repoA, "--all", "--yes")
+	if code != 0 {
+		t.Fatalf("destroy --all --yes failed (code %d): %s", code, errOut)
+	}
+	if !strings.Contains(out, "Destroyed 1 worktree") {
+		t.Fatalf("expected destroyed summary, got stdout:\n%s", out)
+	}
+	if strings.Contains(out, "All worktrees destroyed") {
+		t.Fatalf("destroy must never print a blind 'All worktrees destroyed', got:\n%s", out)
+	}
+	if _, err := os.Stat(wtA); !os.IsNotExist(err) {
+		t.Errorf("repoA worktree still exists after destroy --all: %s", wtA)
+	}
+	if _, err := os.Stat(wtB); err != nil {
+		t.Errorf("repoB worktree must NOT be touched by repoA's destroy --all: %v", err)
+	}
+}
+
+func TestDestroyAllFromManagedWorktreeSubdirUsesMainRepoPool(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+	env := []string{"SHELL=" + exitShellBin}
+
+	if err := os.WriteFile(filepath.Join(repoDir, "treehouse.toml"), []byte("root = \"../treehouse-pool\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	gitCmd(t, repoDir, "add", "treehouse.toml")
+	gitCmd(t, repoDir, "commit", "-m", "configure treehouse root")
+	gitCmd(t, repoDir, "push", "origin", "main")
+
+	leaseOut, leaseErr, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get --lease failed (code %d): %s", code, leaseErr)
+	}
+	leasedPath := strings.TrimSpace(leaseOut)
+	if leasedPath == "" {
+		t.Fatal("could not capture leased worktree path")
+	}
+
+	_, getErr, code := runTreehouse(t, repoDir, homeDir, env, "get")
+	if code != 0 {
+		t.Fatalf("get failed (code %d): %s", code, getErr)
+	}
+	disposablePath := extractWorktreePath(getErr, homeDir)
+	if disposablePath == "" {
+		t.Fatal("could not extract disposable worktree path")
+	}
+
+	subdir := filepath.Join(leasedPath, "nested")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	out, errOut, code := runTreehouseFromDir(t, repoDir, subdir, homeDir, nil, "destroy", ".", "--all", "--yes")
+	if code != 0 {
+		t.Fatalf("destroy . --all --yes failed (code %d): %s", code, errOut)
+	}
+	if !strings.Contains(out, "Destroyed 1 worktree") {
+		t.Fatalf("expected disposable worktree destroyed from managed subdir, got stdout:\n%s", out)
+	}
+	if _, err := os.Stat(disposablePath); !os.IsNotExist(err) {
+		t.Fatalf("expected disposable worktree removed, got err %v", err)
+	}
+	if _, err := os.Stat(leasedPath); err != nil {
+		t.Fatalf("expected leased worktree preserved: %v", err)
+	}
+}
+
+func TestDestroyAllRequiresPoolTarget(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	_, errOut, code := runTreehouse(t, repoDir, homeDir, nil, "destroy", "--all", "--yes")
+	if code == 0 {
+		t.Fatal("expected destroy --all without a pool path to fail")
+	}
+	if !strings.Contains(errOut, "requires a pool path") {
+		t.Fatalf("expected pool-path guidance, got stderr:\n%s", errOut)
+	}
+}
+
+func TestDestroyAllNeverRemovesLeasedWorktree(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	out, errOut, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get --lease failed (code %d): %s", code, errOut)
+	}
+	wtPath := strings.TrimSpace(out)
+	if wtPath == "" {
+		t.Fatal("get --lease printed no path")
+	}
+
+	// Even with --yes, a bulk destroy must never remove the leased home.
+	out, errOut, code = runTreehouse(t, repoDir, homeDir, nil, "destroy", repoDir, "--all", "--yes")
+	if code != 0 {
+		t.Fatalf("destroy --all --yes failed (code %d): %s", code, errOut)
+	}
+	if !strings.Contains(out, "[leased]") || !strings.Contains(out, "Skipped 1 worktree") {
+		t.Fatalf("expected leased worktree reported as skipped, got stdout:\n%s", out)
+	}
+	if strings.Contains(out, "Destroyed 1 worktree") {
+		t.Fatalf("leased worktree must not be destroyed by --all, got stdout:\n%s", out)
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("expected leased worktree to remain on disk: %v", err)
+	}
+
+	// --include-leased may not be combined with --all.
+	_, errOut, code = runTreehouse(t, repoDir, homeDir, nil, "destroy", repoDir, "--all", "--include-leased", "--yes")
+	if code == 0 {
+		t.Fatal("expected --all --include-leased to be rejected")
+	}
+	if !strings.Contains(errOut, "cannot be combined with --all") {
+		t.Fatalf("expected rejection message, got stderr:\n%s", errOut)
+	}
+	if _, err := os.Stat(wtPath); err != nil {
+		t.Fatalf("expected leased worktree to remain on disk after rejected command: %v", err)
+	}
+}
+
+func TestDestroyLeasedSinglePathWithIncludeLeased(t *testing.T) {
+	repoDir, homeDir := setupTestRepo(t)
+
+	out, errOut, code := runTreehouse(t, repoDir, homeDir, nil, "get", "--lease")
+	if code != 0 {
+		t.Fatalf("get --lease failed (code %d): %s", code, errOut)
+	}
+	wtPath := strings.TrimSpace(out)
+	if wtPath == "" {
+		t.Fatal("get --lease printed no path")
+	}
+
+	out, errOut, code = runTreehouse(t, repoDir, homeDir, nil, "destroy", wtPath, "--include-leased", "--yes")
+	if code != 0 {
+		t.Fatalf("destroy <leased> --include-leased --yes failed (code %d): %s", code, errOut)
+	}
+	if !strings.Contains(out, "Destroyed 1 worktree") {
+		t.Fatalf("expected destroyed summary, got stdout:\n%s", out)
+	}
+	if _, err := os.Stat(wtPath); !os.IsNotExist(err) {
+		t.Errorf("leased worktree still exists after --include-leased --yes: %s", wtPath)
 	}
 }
 
@@ -940,7 +1389,15 @@ func TestPruneAllDoesNotDeleteOriginUnreachableWithPruneOrphans(t *testing.T) {
 	}
 }
 
-func TestPruneAllYesDoesNotPartiallyDeleteBeforePlanningAllPools(t *testing.T) {
+// TestPruneAllYesRecoversCorruptPoolWithoutDeletingItsWorktree covers the
+// treehouse-state-atomicity-b4 incident: a corrupt/truncated state file in one
+// pool (e.g. from a crash mid-write) must not brick `prune --all` for every
+// other pool, and the corrupt pool's own on-disk worktree must never be
+// silently deleted since its real reservation state is unknown. ReadState
+// recovers it as a leased worktree, which prune treats like any other
+// leased worktree: skipped, silently, pending human verification via
+// `treehouse status`.
+func TestPruneAllYesRecoversCorruptPoolWithoutDeletingItsWorktree(t *testing.T) {
 	repoA, homeDir := setupTestRepo(t)
 	repoB := setupTestRepoWithHome(t, homeDir, "zzrepo")
 	env := []string{"SHELL=" + exitShellBin}
@@ -970,16 +1427,17 @@ func TestPruneAllYesDoesNotPartiallyDeleteBeforePlanningAllPools(t *testing.T) {
 
 	outsideDir := t.TempDir()
 	_, pruneErr, code := runTreehouseFromDir(t, repoA, outsideDir, homeDir, nil, "prune", "--all", "--yes")
-	if code == 0 {
-		t.Fatal("expected prune --all --yes to fail")
+	if code != 0 {
+		t.Fatalf("prune --all --yes should recover from the corrupt pool rather than fail (code %d): %s", code, pruneErr)
 	}
-	if !strings.Contains(pruneErr, "unexpected end of JSON input") {
-		t.Fatalf("expected corrupt state error, got stderr:\n%s", pruneErr)
+	if !strings.Contains(pruneErr, "corrupt or truncated") {
+		t.Fatalf("expected a recovery warning for the corrupt pool, got stderr:\n%s", pruneErr)
 	}
-	for _, wtPath := range []string{wtPathA, wtPathB} {
-		if _, err := os.Stat(wtPath); err != nil {
-			t.Fatalf("expected worktree to remain at %s: %v", wtPath, err)
-		}
+	if _, err := os.Stat(wtPathA); !os.IsNotExist(err) {
+		t.Fatalf("expected repo A's stale worktree to be pruned normally, stat err: %v", err)
+	}
+	if _, err := os.Stat(wtPathB); err != nil {
+		t.Fatalf("expected repo B's worktree to remain (its pool's state was corrupt): %v", err)
 	}
 }
 

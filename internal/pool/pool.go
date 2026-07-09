@@ -2,6 +2,7 @@ package pool
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,17 +17,58 @@ const (
 	StatusAvailable = "available"
 	StatusDirty     = "dirty"
 	StatusInUse     = "in-use"
+	StatusLeased    = "leased"
 	StatusHere      = "you're here"
 )
 
+// WorktreeStatus describes one managed worktree as reported by List.
 type WorktreeStatus struct {
 	Name      string
 	Path      string
 	Status    string
 	Processes []process.ProcessInfo
+	// LeaseHolder is the recorded holder for a leased worktree, if any.
+	LeaseHolder string
 }
 
+// acquireOptions controls how Acquire reserves the worktree it hands out.
+type acquireOptions struct {
+	// lease records a durable, process-independent reservation instead of the
+	// default short-lived owner reservation.
+	lease bool
+	// leaseHolder is an optional label stored with a lease.
+	leaseHolder string
+	// hookStdout/hookStderr receive post-create hook output. Lease mode routes
+	// hook stdout to stderr so the worktree path stays the only stdout line.
+	hookStdout io.Writer
+	hookStderr io.Writer
+}
+
+// Acquire reserves a clean worktree from the pool with a short-lived owner
+// reservation (the calling process). It is the backing call for the interactive
+// `treehouse get` subshell.
 func Acquire(repoRoot, poolDir string, poolSize int, postCreate []string) (string, error) {
+	return acquire(repoRoot, poolDir, poolSize, postCreate, acquireOptions{
+		hookStdout: os.Stdout,
+		hookStderr: os.Stderr,
+	})
+}
+
+// AcquireLease reserves a clean worktree and marks it durably LEASED so the
+// reservation survives with zero processes running inside it. The lease persists
+// until it is released by Release. holder is an optional label recorded with the
+// lease for diagnostics. Post-create hook stdout is routed to stderr so callers
+// can capture the returned path as the sole stdout line.
+func AcquireLease(repoRoot, poolDir string, poolSize int, postCreate []string, holder string) (string, error) {
+	return acquire(repoRoot, poolDir, poolSize, postCreate, acquireOptions{
+		lease:       true,
+		leaseHolder: holder,
+		hookStdout:  os.Stderr,
+		hookStderr:  os.Stderr,
+	})
+}
+
+func acquire(repoRoot, poolDir string, poolSize int, postCreate []string, opts acquireOptions) (string, error) {
 	branch, err := git.GetDefaultBranch(repoRoot)
 	if err != nil {
 		return "", err
@@ -50,9 +92,9 @@ func Acquire(repoRoot, poolDir string, poolSize int, postCreate []string) (strin
 
 		state = healState(state)
 
-		// Try to find an available worktree (clean and not in-use)
+		// Try to find an available worktree (clean, not in-use, not leased)
 		for i, wt := range state.Worktrees {
-			if wt.Destroying || ownerAlive(wt) {
+			if wt.Destroying || wt.Leased || ownerAlive(wt) {
 				continue
 			}
 			inUse, _ := process.IsWorktreeInUse(wt.Path)
@@ -67,7 +109,7 @@ func Acquire(repoRoot, poolDir string, poolSize int, postCreate []string) (strin
 			if err := git.ResetWorktree(wt.Path, branch); err != nil {
 				continue
 			}
-			if err := reserveOwner(&state.Worktrees[i]); err != nil {
+			if err := markAcquired(&state.Worktrees[i], opts); err != nil {
 				return err
 			}
 			acquired = wt.Path
@@ -100,7 +142,7 @@ func Acquire(repoRoot, poolDir string, poolSize int, postCreate []string) (strin
 			Path:      wtPath,
 			CreatedAt: time.Now(),
 		}
-		if err := reserveOwner(&entry); err != nil {
+		if err := markAcquired(&entry, opts); err != nil {
 			return err
 		}
 		state.Worktrees = append(state.Worktrees, entry)
@@ -116,12 +158,29 @@ func Acquire(repoRoot, poolDir string, poolSize int, postCreate []string) (strin
 		return "", err
 	}
 	if runPostCreate {
-		hooks.Run(postCreate, acquired, os.Stdout, os.Stderr)
+		hooks.Run(postCreate, acquired, opts.hookStdout, opts.hookStderr)
 	}
 
 	return acquired, nil
 }
 
+// markAcquired stamps an acquired worktree entry: a durable lease in lease mode,
+// otherwise the default short-lived owner reservation.
+func markAcquired(wt *WorktreeEntry, opts acquireOptions) error {
+	if opts.lease {
+		wt.Leased = true
+		wt.LeaseHolder = opts.leaseHolder
+		wt.LeasedAt = time.Now()
+		// A lease is process-independent, so it carries no owner reservation.
+		wt.OwnerPID = 0
+		wt.OwnerStartedAt = 0
+		return nil
+	}
+	return reserveOwner(wt)
+}
+
+// Release resets a managed worktree, clears its short-lived owner reservation or
+// durable lease, and returns it to the available pool.
 func Release(poolDir, worktreePath string) error {
 	repoRoot, err := git.FindRepoRootFrom(worktreePath)
 	if err != nil {
@@ -160,6 +219,7 @@ func Release(poolDir, worktreePath string) error {
 				}
 				state.Worktrees[i].OwnerPID = 0
 				state.Worktrees[i].OwnerStartedAt = 0
+				clearLease(&state.Worktrees[i])
 				break
 			}
 		}
@@ -167,6 +227,8 @@ func Release(poolDir, worktreePath string) error {
 	})
 }
 
+// List returns the current status of managed worktrees in poolDir.
+// Leased worktrees are reported with StatusLeased and their optional holder.
 func List(poolDir string) ([]WorktreeStatus, error) {
 	var result []WorktreeStatus
 
@@ -196,7 +258,10 @@ func List(poolDir string) ([]WorktreeStatus, error) {
 			procs, _ := process.FindProcessesInWorktree(wt.Path)
 			ws.Processes = procs
 
-			if ownerAlive(wt) {
+			if wt.Leased {
+				ws.Status = StatusLeased
+				ws.LeaseHolder = wt.LeaseHolder
+			} else if ownerAlive(wt) {
 				ws.Status = StatusInUse
 			} else if len(procs) > 0 {
 				ws.Status = StatusInUse
@@ -213,140 +278,6 @@ func List(poolDir string) ([]WorktreeStatus, error) {
 	})
 
 	return result, err
-}
-
-func Destroy(repoRoot, poolDir, worktreePath string, force bool, preDestroy []string) error {
-	var reserved WorktreeEntry
-	if err := WithStateLock(poolDir, func() error {
-		state, err := ReadState(poolDir)
-		if err != nil {
-			return err
-		}
-
-		idx := -1
-		for i, wt := range state.Worktrees {
-			if wt.Path == worktreePath {
-				idx = i
-				break
-			}
-		}
-		if idx == -1 {
-			return fmt.Errorf("worktree %s is not managed by treehouse", worktreePath)
-		}
-
-		if !force {
-			inUse, _ := worktreeInUse(state.Worktrees[idx])
-			if inUse {
-				return fmt.Errorf("worktree %s is in use by an agent. Use --force to override", worktreePath)
-			}
-		}
-
-		state.Worktrees[idx].Destroying = true
-		if err := reserveOwner(&state.Worktrees[idx]); err != nil {
-			return err
-		}
-		reserved = state.Worktrees[idx]
-		return WriteState(poolDir, state)
-	}); err != nil {
-		return err
-	}
-
-	hooks.Run(preDestroy, worktreePath, os.Stdout, os.Stderr)
-
-	return WithStateLock(poolDir, func() error {
-		state, err := ReadState(poolDir)
-		if err != nil {
-			return err
-		}
-
-		idx := -1
-		for i, wt := range state.Worktrees {
-			if wt.Path == worktreePath {
-				idx = i
-				break
-			}
-		}
-		if idx == -1 {
-			return nil
-		}
-		if !sameDestroyReservation(state.Worktrees[idx], reserved) {
-			return nil
-		}
-
-		_ = git.RemoveWorktree(repoRoot, worktreePath)
-		// also clean up the parent numbered directory
-		os.RemoveAll(filepath.Dir(worktreePath))
-
-		state.Worktrees = append(state.Worktrees[:idx], state.Worktrees[idx+1:]...)
-		return WriteState(poolDir, state)
-	})
-}
-
-func DestroyAll(repoRoot, poolDir string, force bool, preDestroy []string) error {
-	var worktrees []WorktreeEntry
-	if err := WithStateLock(poolDir, func() error {
-		state, err := ReadState(poolDir)
-		if err != nil {
-			return err
-		}
-
-		if !force {
-			for _, wt := range state.Worktrees {
-				inUse, _ := worktreeInUse(wt)
-				if inUse {
-					return fmt.Errorf("worktree %s is in use by an agent. Use --force to override", wt.Path)
-				}
-			}
-		}
-
-		for i := range state.Worktrees {
-			state.Worktrees[i].Destroying = true
-			if err := reserveOwner(&state.Worktrees[i]); err != nil {
-				return err
-			}
-		}
-		worktrees = append([]WorktreeEntry(nil), state.Worktrees...)
-		return WriteState(poolDir, state)
-	}); err != nil {
-		return err
-	}
-
-	for _, wt := range worktrees {
-		hooks.Run(preDestroy, wt.Path, os.Stdout, os.Stderr)
-	}
-
-	return WithStateLock(poolDir, func() error {
-		state, err := ReadState(poolDir)
-		if err != nil {
-			return err
-		}
-
-		remove := make(map[string]struct{}, len(worktrees))
-		for _, wt := range worktrees {
-			idx := -1
-			for i := range state.Worktrees {
-				if state.Worktrees[i].Path == wt.Path {
-					idx = i
-					break
-				}
-			}
-			if idx == -1 || !sameDestroyReservation(state.Worktrees[idx], wt) {
-				continue
-			}
-			remove[wt.Path] = struct{}{}
-			_ = git.RemoveWorktree(repoRoot, wt.Path)
-			os.RemoveAll(filepath.Dir(wt.Path))
-		}
-
-		kept := state.Worktrees[:0]
-		for _, wt := range state.Worktrees {
-			if _, ok := remove[wt.Path]; !ok {
-				kept = append(kept, wt)
-			}
-		}
-		state.Worktrees = kept
-		return WriteState(poolDir, state)
-	})
 }
 
 func FindByPath(poolDir, path string) (*WorktreeEntry, error) {
@@ -397,11 +328,11 @@ func reserveOwner(wt *WorktreeEntry) error {
 	return nil
 }
 
-func worktreeInUse(wt WorktreeEntry) (bool, error) {
-	if ownerAlive(wt) {
-		return true, nil
-	}
-	return process.IsWorktreeInUse(wt.Path)
+// clearLease removes any durable lease from a worktree entry.
+func clearLease(wt *WorktreeEntry) {
+	wt.Leased = false
+	wt.LeaseHolder = ""
+	wt.LeasedAt = time.Time{}
 }
 
 func sameDestroyReservation(current, reserved WorktreeEntry) bool {
