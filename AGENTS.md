@@ -1,8 +1,9 @@
-# Treehouse - Agent Guide
+## AGENTS.md — Treehouse
 
-## What is this?
+Go CLI tool that manages a pool of git worktrees for parallel AI coding agent workflows. It maintains reusable, pre-warmed worktrees so agents get isolated environments instantly.
 
-Treehouse is a Go CLI tool that manages a pool of git worktrees for parallel AI coding agent workflows. It maintains reusable, pre-warmed worktrees so agents get isolated environments instantly.
+- **Language/stack:** Go 1.25.5 (per go.mod)
+- **Default branch:** `main`
 
 ## Project Structure
 
