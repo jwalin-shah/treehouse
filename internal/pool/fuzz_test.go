@@ -116,7 +116,7 @@ func FuzzPoolDestroyContention(f *testing.F) {
 				defer wg.Done()
 				<-startCh
 				if idx%2 == 0 {
-					_ = Destroy(repoDir, poolDir, wtPath, true, nil)
+					_, _ = DestroyWorktree(poolDir, wtPath, DestroyOptions{IncludeUnlanded: true})
 				} else {
 					path, err := Acquire(repoDir, poolDir, 5, nil)
 					if err == nil {
@@ -185,7 +185,7 @@ func FuzzPoolDestroyAllContention(f *testing.F) {
 				defer wg.Done()
 				<-startCh
 				if idx%3 == 0 {
-					_ = DestroyAll(repoDir, poolDir, true, nil)
+					_, _ = DestroyPool(poolDir, DestroyOptions{IncludeUnlanded: true})
 				} else if idx%3 == 1 {
 					path, err := Acquire(repoDir, poolDir, 5, nil)
 					if err == nil {

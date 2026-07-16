@@ -2329,7 +2329,7 @@ func TestConcurrency(t *testing.T) {
 			go func(idx int) {
 				defer wg.Done()
 				<-startCh
-				results[idx] = Destroy(repoDir, poolDir, wtPath, true, nil)
+				_, results[idx] = DestroyWorktree(poolDir, wtPath, DestroyOptions{IncludeUnlanded: true})
 			}(i)
 		}
 		close(startCh)
